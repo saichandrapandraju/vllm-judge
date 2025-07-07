@@ -18,6 +18,10 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+DECISION_ALTERNATIVES = ["label", "judgment", "result", "output", "prediction", "response"]
+REASONING_ALTERNATIVES = ["reason", "explanation", "justification", "rationale", "thought", "thinking"]
+SCORE_ALTERNATIVES = ["confidence", "probability", "prob", "grade", "rating", "score_value", "value"]
+REQUIRED_FIELDS = ["decision", "reasoning"]
 
 class Judge:
     """Main class for LLM-as-a-Judge evaluations."""
@@ -63,7 +67,7 @@ class Judge:
     
     async def evaluate(
         self,
-        content: Union[str, Dict[str, str]],
+        content: Union[str, Dict[str, str], List[Dict[str, str]]],
         input: Optional[str] = None,
         criteria: str = None,
         rubric: Union[str, Dict[Union[int, float], str]] = None,
@@ -74,13 +78,14 @@ class Judge:
         context: str = None,
         template_vars: Dict[str, Any] = None,
         template_engine: Union[str, TemplateEngine] = TemplateEngine.FORMAT,
+        sampling_params: Optional[Dict[str, Any]] = None,
         **kwargs
     ) -> EvaluationResult:
         """
         Universal evaluation method that adapts to use case.
         
         Args:
-            content: String for single evaluation, dict {"a": ..., "b": ...} for comparison
+            content: String for single evaluation, list of dicts for conversation, dict {"a": ..., "b": ...} for comparison
             input: Optional input/question/prompt that the content is responding to
             criteria: What to evaluate for (can contain template variables)
             rubric: Instructions for evaluation, can be string or dict containing mapping of score to description (can contain template variables)
@@ -91,7 +96,8 @@ class Judge:
             context: Optional context for the evaluation
             template_vars: Variables to substitute in templates
             template_engine: Template engine to use ('format' or 'jinja2'), default is 'format'
-            **kwargs: Additional parameters
+            sampling_params: Optional sampling parameters for vLLM
+            **kwargs: Additional instructions for the model (e.g., with `additional_instructions` key)
             
         Returns:
             EvaluationResult with decision, reasoning, and optional score
@@ -101,17 +107,41 @@ class Judge:
             MetricNotFoundError: If metric name not found
             ParseError: If unable to parse model response
         """
+        if metric and isinstance(metric, str):
+            metric: Metric = self.get_metric(metric)
+
         # Handle model-specific metrics
         if isinstance(metric, ModelSpecificMetric):
-            assert isinstance(content, str), "Model-specific metrics only support string content for now"
+            if isinstance(content, dict):
+                raise InvalidInputError("Model-specific metrics only support string and list of dicts as content for now")
+            
+            if isinstance(content, list) and len(content) == 0:
+                raise InvalidInputError("Conversation content cannot be an empty list.")
+            
+            is_conversation = (
+                isinstance(content, list) and 
+                all(isinstance(msg, dict) and "role" in msg and "content" in msg for msg in content)
+            )
+            if isinstance(content, list) and not is_conversation:
+                raise InvalidInputError("Invalid content structure for conversation. Please provide a list of dicts with role and content fields.")
+            
+            
+            # Skip ALL our formatting
+            if is_conversation:
+                messages = content
+            else:
+                messages = [{"role": "user", "content": content}]
 
             # logger.info(f"Evaluating model-specific metric {metric.name}.")
             logger.info(f"We assume you're using {metric.model_pattern} type model. If not, please do not use this metric and use a normal metric instead.")
-            # Skip ALL our formatting
-            messages = [{"role": "user", "content": content}]
+
+            if metric.sampling_params:
+                if sampling_params is None:
+                    sampling_params = {}
+                sampling_params.update(metric.sampling_params)
             
             # vLLM applies model's chat template automatically
-            llm_response = await self._call_model(messages)
+            llm_response = await self._call_model(messages, sampling_params, return_choices=metric.return_choices)
             
             # Use metric's parser
             return metric.parser_func(llm_response)
@@ -121,8 +151,6 @@ class Judge:
         metric_template_vars = {}
         
         if metric:
-            if isinstance(metric, str):
-                metric = self.get_metric(metric)
             # Use metric defaults but allow overrides
             criteria = criteria or metric.criteria
             rubric = rubric or metric.rubric
@@ -176,9 +204,9 @@ class Judge:
             **kwargs
         )
         
-        # Get LLM response
-        llm_response = await self._call_model(messages)
-        
+        # Get LLM response. We don't need choices for now.
+        llm_response:str = await self._call_model(messages, sampling_params, return_choices=False)
+
         # Parse response
         result = self._parse_response(llm_response)
         
@@ -189,16 +217,39 @@ class Judge:
         
         return result
     
-    async def _call_model(self, messages: List[Dict[str, str]]) -> str:
+    async def _call_model(self, messages: List[Dict[str, str]], 
+                          sampling_params: Optional[Dict[str, Any]] = None,
+                          return_choices: bool = False) -> Union[str, List[Dict[str, Any]]]:
         """
         Call the model with the given messages.
+
+        Args:
+            messages: List of messages
+            sampling_params: Sampling parameters
+            return_choices: Whether to return choices
+
+        Returns:
+            str model response if return_choices is False, otherwise List[Dict[str, Any]]
         """
+        if sampling_params and 'n' in sampling_params and sampling_params['n'] > 1:
+            raise InvalidInputError("n > 1 is not supported for now")
+        
+        # Merge sampling params
+        final_sampling_params = {**self.config.sampling_params}
+        if sampling_params:
+            final_sampling_params.update(sampling_params)
         try:
             if self.config.use_chat_api:
-                llm_response = await self.client.chat_completion(messages)
+                llm_response = await self.client.chat_completion(
+                    messages,
+                    sampling_params=final_sampling_params,
+                    return_choices=return_choices)
             else:
                 prompt = PromptBuilder.format_messages_as_text(messages)
-                llm_response = await self.client.completion(prompt)
+                llm_response = await self.client.completion(
+                    prompt,
+                    sampling_params=final_sampling_params,
+                    return_choices=return_choices)
             return llm_response
         except Exception as e:
             raise VLLMJudgeError(f"Failed to get model response: {e}")
@@ -208,6 +259,11 @@ class Judge:
         """
         Parse LLM response into EvaluationResult.
         
+        Uses multiple parsing strategies in order of preference:
+        1. Direct JSON parsing
+        2. JSON extraction from markdown code blocks  
+        3. Regex-based JSON structure detection
+        
         Args:
             response: Raw LLM response
             
@@ -215,47 +271,40 @@ class Judge:
             Parsed EvaluationResult
             
         Raises:
-            ParseError: If unable to parse response
+            ParseError: If unable to parse response or missing required fields
         """
-        # Try to parse as JSON
-        try:
-            # First attempt: direct JSON parsing
-            data = json.loads(response.strip())
-        except json.JSONDecodeError:
-            # Second attempt: extract JSON from markdown code blocks
-            json_match = re.search(r'```(?:json)?\s*({.*?})\s*```', response, re.DOTALL)
-            if json_match:
-                try:
-                    data = json.loads(json_match.group(1))
-                except json.JSONDecodeError:
-                    pass
-            else:
-                # Third attempt: find JSON-like structure
-                json_match = re.search(r'({[^{}]*"decision"[^{}]*})', response, re.DOTALL)
-                if json_match:
-                    try:
-                        data = json.loads(json_match.group(1))
-                    except json.JSONDecodeError:
-                        raise ParseError(
-                            "Failed to parse JSON from response",
-                            raw_response=response
-                        )
-                else:
-                    raise ParseError(
-                        "No JSON structure found in response",
-                        raw_response=response
-                    )
+        logger.debug(f"Parsing response: {response[:100]}...")
         
-        # Validate required fields
-        if "decision" not in data:
+        # Try each parsing strategy
+        parsing_strategies = [
+            ("direct JSON", self._parse_direct_json),
+            ("markdown JSON", self._parse_markdown_json), 
+            ("regex JSON", self._parse_regex_json)
+        ]
+        
+        data = None
+        for strategy_name, strategy_func in parsing_strategies:
+            data = strategy_func(response)
+            if data is not None:
+                logger.debug(f"Successfully parsed using {strategy_name}")
+                break
+        
+        if data is None:
             raise ParseError(
-                "Response missing required 'decision' field",
+                "Unable to extract valid JSON from response using any parsing strategy",
                 raw_response=response
             )
         
-        if "reasoning" not in data:
-            # Try to extract reasoning from other fields
-            data["reasoning"] = data.get("reason", data.get("explanation", "No reasoning provided"))
+        # Validate and normalize the data
+        try:
+            data = self._validate_and_normalize_data(data, response)
+        except ParseError:
+            raise  # Re-raise ParseError as-is
+        except Exception as e:
+            raise ParseError(
+                f"Data validation failed: {e}",
+                raw_response=response
+            )
         
         # Create result
         return EvaluationResult(
@@ -269,6 +318,99 @@ class Judge:
             }
         )
     
+    def _parse_direct_json(self, response: str) -> Optional[Dict[str, Any]]:
+        """Attempt direct JSON parsing."""
+        try:
+            return json.loads(response.strip())
+        except json.JSONDecodeError as e:
+            logger.debug(f"Direct JSON parsing failed: {e}")
+            return None
+
+    def _parse_markdown_json(self, response: str) -> Optional[Dict[str, Any]]:
+        """Extract JSON from markdown code blocks."""
+        json_match = re.search(r'```(?:json)?\s*({.*?})\s*```', response, re.DOTALL)
+        if json_match:
+            try:
+                return json.loads(json_match.group(1))
+            except json.JSONDecodeError as e:
+                logger.debug(f"Markdown JSON parsing failed: {e}")
+                return None
+        return None
+    
+    def _parse_regex_json(self, response: str) -> Optional[Dict[str, Any]]:
+        """Find JSON-like structure using regex."""
+        # Look for JSON containing "decision" field - more flexible pattern
+        json_match = re.search(r'(\{[^{}]*"decision"[^{}]*\})', response, re.DOTALL)
+        if json_match:
+            try:
+                return json.loads(json_match.group(1))
+            except json.JSONDecodeError as e:
+                logger.debug(f"Regex JSON parsing failed: {e}")
+                return None
+        return None
+    
+
+    def _validate_and_normalize_data(self, data: Dict[str, Any], response: str) -> Dict[str, Any]:
+        """Validate and normalize parsed data."""
+
+        # Handle missing decision field
+        if "decision" not in data:
+            for alt_field in DECISION_ALTERNATIVES:
+                if alt_field in data:
+                    data["decision"] = data[alt_field]
+                    logger.debug(f"Used '{alt_field}' field for decision")
+                    break
+        
+        # Handle missing reasoning field with fallbacks
+        if "reasoning" not in data:
+            for alt_field in REASONING_ALTERNATIVES:
+                if alt_field in data:
+                    data["reasoning"] = data[alt_field]
+                    logger.debug(f"Used '{alt_field}' field for reasoning")
+                    break
+            else:
+                data["reasoning"] = "=== No reasoning provided ==="
+                logger.warning("No reasoning field found, using default")
+        
+        # Handle missing score field with fallbacks
+        if "score" not in data:
+            for alt_field in SCORE_ALTERNATIVES:
+                if alt_field in data:
+                    data["score"] = data[alt_field]
+                    logger.debug(f"Used '{alt_field}' field for score")
+                    break
+            else:
+                data["score"] = None
+                logger.warning("No score field found, setting to None")
+        
+        # Check for required fields
+        for field in REQUIRED_FIELDS:
+            if field not in data:
+                raise ParseError(
+                    f"Response missing required '{field}' field",
+                    raw_response=response
+                )
+        
+        # Validate field types
+        if not isinstance(data["decision"], (str, bool, int,float)):
+            logger.warning(f"Decision field has unexpected type: {type(data['decision'])}")
+        
+        if not isinstance(data["reasoning"], str):
+            data["reasoning"] = str(data["reasoning"])
+            logger.debug("Converted reasoning to string")
+        
+        # Validate score if present
+        if "score" in data and data["score"] is not None:
+            if not isinstance(data["score"], (int, float)):
+                try:
+                    data["score"] = float(data["score"])
+                    logger.debug("Converted score to float")
+                except (ValueError, TypeError):
+                    logger.warning(f"Invalid score value: {data['score']}, setting to None")
+                    data["score"] = None
+        
+        return data
+
     # Convenience methods
     async def score(
         self,
@@ -436,6 +578,7 @@ class Judge:
         data: List[Dict[str, Any]],
         max_concurrent: int = None,
         progress_callback: Callable[[int, int], None] = None,
+        sampling_params: Optional[Dict[str, Any]] = None,
         **default_kwargs
     ) -> BatchResult:
         """
@@ -459,7 +602,7 @@ class Judge:
             ])
         """
         processor = BatchProcessor(self, max_concurrent or self.config.max_concurrent)
-        return await processor.process(data, progress_callback, **default_kwargs)
+        return await processor.process(data, progress_callback, sampling_params, **default_kwargs)
     
     async def batch_score(
         self,

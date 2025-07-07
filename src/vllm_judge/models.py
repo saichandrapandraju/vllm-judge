@@ -56,10 +56,15 @@ class JudgeConfig(BaseModel):
     max_retries: int = Field(3, description="Maximum retry attempts")
     retry_delay: float = Field(1.0, description="Initial retry delay in seconds")
     
-    # Model parameters
-    temperature: float = Field(0.0, description="Sampling temperature")
-    max_tokens: int = Field(256, description="Maximum tokens in response")
-    
+    # vLLM sampling parameters
+    sampling_params: Dict[str, Any] = Field(
+        default_factory=lambda: {
+            "temperature": 0.0,
+            "max_tokens": 256
+        },
+        description="Default sampling parameters for vLLM"
+    )
+
     # Batch settings
     max_concurrent: int = Field(50, description="Maximum concurrent requests")
         
@@ -163,11 +168,13 @@ class Metric:
 class ModelSpecificMetric(Metric):
     """Metric that bypasses our prompt formatting."""
     
-    def __init__(self, name: str, model_pattern: str, parser_func: Callable[[str], EvaluationResult]):
+    def __init__(self, name: str, model_pattern: str, parser_func: Callable[[Union[str, List[Dict[str, Any]]]], EvaluationResult],
+                 sampling_params: Optional[Dict[str, Any]] = None, return_choices: bool = False):
         super().__init__(name=name, criteria="model-specific evaluation")
         self.model_pattern = model_pattern
         self.parser_func = parser_func
-        # self.is_model_specific = True  # Flag for special handling
+        self.sampling_params = sampling_params
+        self.return_choices = return_choices
 
 class BatchResult(BaseModel):
     """Result of batch evaluation."""

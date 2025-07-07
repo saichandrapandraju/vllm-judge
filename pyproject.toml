@@ -29,6 +29,7 @@ dependencies = [
     "pydantic>=2.0.0",
     "tenacity>=8.0.0",
     "click>=8.0.0",
+    "numpy>=2.2.6",
 ]
 
 [project.optional-dependencies]
@@ -64,9 +65,9 @@ dev = [
 vllm-judge = "vllm_judge.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/saichandrapandraju/vllm_judge"
-Repository = "https://github.com/saichandrapandraju/vllm_judge"
-Issues = "https://github.com/saichandrapandraju/vllm_judge/issues"
+Homepage = "https://trustyai.org/vllm_judge/"
+Repository = "https://github.com/trustyai-explainability/vllm_judge"
+Issues = "https://github.com/trustyai-explainability/vllm_judge/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
